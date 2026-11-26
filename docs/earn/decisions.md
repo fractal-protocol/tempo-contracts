@@ -88,10 +88,11 @@ equalization, separate share series, or restricted entry and exit windows. A sin
 EarnShare with one aggregate high-water mark cannot distinguish those holder cohorts.
 
 **Consequence:** ordinary actions remain nonblocking and checkpoint fees atomically without relying
-on a keeper. Active checkpoints may take a no-accrual fast path when value per EarnShare has not
-exceeded the high-water mark, but that optimization preserves target recovery and does not defer a
-fee that could affect flow pricing. A fixed-interval policy would be an accounting redesign, not a
-gas optimization.
+on a keeper. Active checkpoints take a no-accrual fast path until value per EarnShare is one step
+(one asset unit per whole EarnShare) above the high-water mark. That accrual waits above the mark
+for a later checkpoint rather than being dropped, so checkpoint cadence does not change fees; the
+fee it defers affects flow pricing by less than one step per EarnShare, and the fast path preserves
+target recovery. A fixed-interval policy would be an accounting redesign, not a gas optimization.
 
 ## Fixed EarnVault implementation proxies
 
@@ -129,6 +130,6 @@ security boundary rather than being a generic externalization.
 **Decision:** record engine kind and the scoped `earnRouter` on each stack, with no separate product
 records, and expose the operational `EarnStack` through `@tempoxyz/contracts/deployments/operations`.
 
-**Why:** the engine kind (`erc4626`, `veda`, or `propamm`) describes execution, not the asset, so it
+**Why:** the engine kind (`erc4626`, `veda`, or `propamm`; `HoldEngine` has none) describes execution, not the asset, so it
 belongs to the stack rather than a product indirection. Stack-scoped router addresses preserve the immutable Zone and EarnVault
 bindings.

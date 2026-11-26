@@ -9,7 +9,8 @@ import {
   type DeploymentSource,
   type EarnDeploymentRecord,
 } from './record.js'
-import { runtimeCodeHash } from './releases.js'
+import type { IntentComponent } from './components.js'
+import { runtimeCodeHash, runtimeCodeIdentity, type CompiledRuntimeCode } from './releases.js'
 import { tempoVerifierUrl } from './verify.js'
 import { deploymentSteps } from '../modules/index.js'
 import {
@@ -33,6 +34,34 @@ export async function runtimeCodeHashes(
   return Object.fromEntries(
     keys.map((key, index) => [key, hashes[index]]),
   ) as EarnDeploymentRecord['runtimeCodeHashes']
+}
+
+/**
+ * Intent components whose recorded replaceable contracts no longer run this checkout's build,
+ * compared with immutable slots zeroed and compiler metadata removed (including that of child
+ * creation code a factory embeds), so only a code change counts;
+ * reconciliation replaces them like a changed intent.
+ */
+export async function replacedComponents(
+  client: Pick<PublicClient, 'getCode'>,
+  profile: EarnDeploymentProfile,
+  record: Pick<EarnDeploymentRecord, 'addresses'>,
+  compile: (contract: string) => CompiledRuntimeCode,
+) {
+  const replaced = new Set<IntentComponent>()
+  for (const step of deploymentSteps) {
+    if (step.execution !== 'foundry' || !step.enabled(profile)) continue
+    const source = step.source
+    const recorded = source && record.addresses[source.output]
+    if (!source?.replaceOnCodeChange?.(profile) || !recorded) continue
+    const { bytecode, references } = compile(source.contract)
+    const code = await client.getCode({ address: recorded })
+    if (!code || code === '0x')
+      throw new Error(`No runtime code at addresses.${source.output} ${recorded}`)
+    if (runtimeCodeIdentity(code, references) !== runtimeCodeIdentity(bytecode, references))
+      for (const component of step.intent) replaced.add(component)
+  }
+  return replaced
 }
 
 /**

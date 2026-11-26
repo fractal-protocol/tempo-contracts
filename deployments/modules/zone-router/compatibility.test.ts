@@ -14,12 +14,13 @@ import { describe, expect, test, vi } from 'vitest'
 import { zoneRouterAbi } from '../../abis/index.js'
 import { pendingDeploymentPath } from '../../core/bundle.js'
 import { planEarnDeployment } from '../../core/plan.js'
-import { restorePendingDeployment } from '../../core/pending.js'
+import { restorePendingDeployment, savePendingDeployment } from '../../core/pending.js'
+import { replacedComponents } from '../../core/provenance.js'
 import { componentDeploymentIntentHashes, parseEarnDeploymentProfile } from '../../core/profile.js'
 import { prepareLifecycleStep } from '../../core/reconcile.js'
 import type { ChainClient } from '../module.js'
 import { zoneRouterModeModule } from './index.js'
-import { zoneRouterMode, zoneRouterModeProfile } from './profile.js'
+import { zoneRouterMode } from './profile.js'
 import { deployZoneRouter } from './steps.js'
 
 const rpc = vi.hoisted(() => ({ client: undefined as ChainClient | undefined }))
@@ -101,12 +102,6 @@ describe('retained Zone router ABI compatibility', () => {
         actions: { 'deploy-zone-router-factory': completed, 'deploy-zone-router': completed },
       }
       const before = structuredClone(committed)
-      expect(zoneRouterModeProfile.components.zoneRouter(profile, 'deployment')).toMatchObject({
-        contractRelease: 2,
-      })
-      expect(
-        zoneRouterModeProfile.components.zoneRouterFactory(profile, 'deployment'),
-      ).toMatchObject({ contractRelease: 2 })
       const restored = restorePendingDeployment(profilePath, profile, committed)
       expect(restored.outputs.zoneRouter).toBe(outputs.zoneRouter)
       expect(restored.outputs.zoneRouterFactory).toBe(outputs.zoneRouterFactory)
@@ -129,6 +124,158 @@ describe('retained Zone router ABI compatibility', () => {
       )
       expect(readFileSync(pendingDeploymentPath(profilePath), 'utf8')).toBe(pending)
       expect(committed).toEqual(before)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('router code identity', () => {
+  // Runtime bytes with one immutable byte at offset 1, which differs per deployment.
+  const compiled = { bytecode: '0x60aa60bb' as const, references: [{ start: 1, length: 1 }] }
+  const compile = () => ({ ...compiled, referenceGroups: [compiled.references] })
+  const deployedAt = (code: Record<string, string>) =>
+    ({ getCode: async ({ address }: { address: Address }) => code[address] }) as never
+
+  test('keeps routers whose runtime matches the build apart from immutables', async () => {
+    const client = deployedAt({
+      [outputs.zoneRouterFactory]: '0x60ff60bb',
+      [outputs.zoneRouter]: '0x601160bb',
+    })
+    expect(await replacedComponents(client, profile, { addresses: outputs }, compile)).toEqual(
+      new Set(),
+    )
+  })
+
+  test('keeps routers whose build differs only in its metadata tail', async () => {
+    // Solar's tail for two source texts: {ipfs: <hash>, solar: 0.3.1}, then its length.
+    const tail = (hash: string) => `a2646970667358221220${hash.repeat(32)}65736f6c6172430003010034`
+    const withTail = () => ({ ...compile(), bytecode: `0x60aa60bb${tail('11')}` as const })
+    const client = deployedAt({
+      [outputs.zoneRouterFactory]: `0x60ff60bb${tail('22')}`,
+      [outputs.zoneRouter]: `0x601160bb${tail('33')}`,
+    })
+    expect(await replacedComponents(client, profile, { addresses: outputs }, withTail)).toEqual(
+      new Set(),
+    )
+    const changed = deployedAt({
+      [outputs.zoneRouterFactory]: `0x60ff60bb${tail('22')}`,
+      [outputs.zoneRouter]: `0x601160cc${tail('11')}`,
+    })
+    expect(await replacedComponents(changed, profile, { addresses: outputs }, withTail)).toEqual(
+      new Set(['zoneRouterFactory', 'zoneRouter']),
+    )
+  })
+
+  test('keeps a factory whose embedded router differs only in its metadata', async () => {
+    const tail = (hash: string) => `a2646970667358221220${hash.repeat(32)}65736f6c6172430003010034`
+    // The factory runtime ends with the router's creation code, then its own tail, each behind INVALID.
+    const factory = (child: string, hashes: [string, string]) =>
+      `0x60aa60bb${child}fe${tail(hashes[0])}fe${tail(hashes[1])}` as const
+    const build = (contract: string) => ({
+      ...compile(),
+      bytecode: contract.endsWith(':ZoneRouterFactory')
+        ? factory('6001', ['11', '22'])
+        : (`0x60aa60bb${tail('66')}` as const),
+    })
+    const client = deployedAt({
+      [outputs.zoneRouterFactory]: factory('6001', ['33', '44']).replace('60aa', '60ff'),
+      [outputs.zoneRouter]: `0x601160bb${tail('55')}`,
+    })
+    expect(await replacedComponents(client, profile, { addresses: outputs }, build)).toEqual(
+      new Set(),
+    )
+    const changed = deployedAt({
+      [outputs.zoneRouterFactory]: factory('6002', ['11', '22']),
+      [outputs.zoneRouter]: `0x601160bb${tail('55')}`,
+    })
+    expect(await replacedComponents(changed, profile, { addresses: outputs }, build)).toEqual(
+      new Set(['zoneRouterFactory']),
+    )
+  })
+
+  test('replaces a router built from other code with the components its deployment depends on', async () => {
+    const client = deployedAt({
+      [outputs.zoneRouterFactory]: '0x60ff60bb',
+      [outputs.zoneRouter]: '0x601160cc',
+    })
+    expect(await replacedComponents(client, profile, { addresses: outputs }, compile)).toEqual(
+      new Set(['zoneRouterFactory', 'zoneRouter']),
+    )
+  })
+
+  test('restores neither the address nor the actions of a replaced component', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zone-router-replaced-'))
+    try {
+      const completed = {
+        completedAt: '2026-01-01T00:00:00.000Z',
+        verification: 'chain' as const,
+        transactions: [`0x${'a'.repeat(64)}` as const],
+      }
+      const restored = restorePendingDeployment(
+        join(root, 'profile.json'),
+        profile,
+        {
+          componentDeploymentIntentHashes: componentDeploymentIntentHashes(profile),
+          addresses: outputs,
+          actions: { 'deploy-zone-router-factory': completed, 'deploy-zone-router': completed },
+        },
+        new Set(['zoneRouter']),
+      )
+      expect(restored.outputs.zoneRouter).toBeUndefined()
+      expect(restored.outputs.zoneRouterFactory).toBe(outputs.zoneRouterFactory)
+      expect(restored.actions).toEqual({ 'deploy-zone-router-factory': completed })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('drops stale cached routers but resumes a paused replacement that runs this build', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zone-router-replaced-cache-'))
+    try {
+      const path = join(root, 'profile.json')
+      const completed = {
+        completedAt: '2026-01-01T00:00:00.000Z',
+        verification: 'chain' as const,
+        transactions: [`0x${'a'.repeat(64)}` as const],
+      }
+      const committed = {
+        componentDeploymentIntentHashes: componentDeploymentIntentHashes(profile),
+        addresses: outputs,
+        actions: { 'deploy-zone-router-factory': completed, 'deploy-zone-router': completed },
+      }
+      // An earlier run restored the old router into pending state, then stopped.
+      restorePendingDeployment(path, profile, committed)
+      const stale = restorePendingDeployment(path, profile, committed, new Set(['zoneRouter']))
+      expect(stale.outputs.zoneRouter).toBeUndefined()
+      expect(stale.actions['deploy-zone-router']).toBeUndefined()
+      // A replacement deployed before the run stopped is not the old code and is resumed.
+      const replacement = { ...completed, transactions: [`0x${'b'.repeat(64)}` as const] }
+      savePendingDeployment(path, profile, {
+        ...stale,
+        outputs: { ...stale.outputs, zoneRouter: address('b2') },
+        actions: { ...stale.actions, 'deploy-zone-router': replacement },
+      })
+      // The cached replacement runs this build, so only the recorded router is stale.
+      const resumed = restorePendingDeployment(
+        path,
+        profile,
+        committed,
+        new Set(['zoneRouter']),
+        new Set(),
+      )
+      expect(resumed.outputs.zoneRouter).toBe(address('b2'))
+      expect(resumed.actions['deploy-zone-router']).toEqual(replacement)
+      // After another router code change the paused replacement is stale too, and is dropped.
+      const superseded = restorePendingDeployment(
+        path,
+        profile,
+        committed,
+        new Set(['zoneRouter']),
+        new Set(['zoneRouter']),
+      )
+      expect(superseded.outputs.zoneRouter).toBeUndefined()
+      expect(superseded.actions['deploy-zone-router']).toBeUndefined()
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

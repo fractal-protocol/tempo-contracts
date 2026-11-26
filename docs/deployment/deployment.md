@@ -9,7 +9,7 @@ the [Zone router releases](#zone-router-releases), and the [Bridge releases](#br
 [deployment package reference](../../deployments/README.md).
 
 The current Foundry deployment scripts and this profile lifecycle tooling are outside audit scope
-([audits](../earn/audit/README.md#scope)).
+([audits](../audits.md#coverage)).
 
 ## Commands
 
@@ -306,7 +306,12 @@ completed deployment steps derived from the plan. Activation steps are not recor
 always read from the pool and Portal. Changing an optional component (`zone`, `targetYield`,
 `boostRewards`, `zoneRouterFactory`, `zoneRouter`) redeploys only that component's contracts and republishes the record; core and
 engine creation intent never changes in place, so a record whose `core` or `engine` hash differs
-from the profile is refused. The deployment-fixed engine migration mode either permits the operator
+from the profile is refused. The immutable Zone routers and the `ZoneRouterFactory` are also replaced,
+with the steps that configure them, when a recorded one's runtime differs from this checkout's build
+(compiler-declared immutable slots and the CBOR metadata aside: the trailing tail, and the tail of the
+`ZoneRouter` creation code the factory embeds just before it), so a code or compiler change that
+changes the runtime redeploys them on the next deploy without any profile change, while a
+comment-only change does not, including one to `ZoneRouter.sol` alone. The deployment-fixed engine migration mode either permits the operator
 to move the whole pool to a replacement engine (`OperatorEnabled`) or permanently forbids that
 action (`UserOnly`). A permitted [whole-pool migration](../earn/architecture/system.md#whole-pool-engine-migration)
 does not rewrite creation provenance.
@@ -559,11 +564,16 @@ are ownerless, and their constructors impose no PATHUSD transfer-policy ID. The 
 funded and authorized to pay fees under its chosen fee token's live policy; a custom PATHUSD policy
 does not by itself block a release.
 
-The repository compiles with solar ([`solar.lock`](../../solar.lock)). Tempo's source verifier
-rebuilds only the solar builds it pins in tempo-apps'
-[`solar-builds.json`](https://github.com/tempoxyz/tempo-apps/blob/main/apps/contract-verification/container/solar-builds.json),
-so a new `solar.lock` revision must be added there and deployed before a hosted deployment built
-with it. Source verification passes Forge the solar build (`--compiler-version`, from
+The repository compiles with a published solar release: [`solar.lock`](../../solar.lock) names the
+release by its tag's commit, and [`solar-releases.json`](../../solar-releases.json) records that
+release's version and the SHA-256 of each platform's release archive, which `pnpm deps` checks
+before installing the binary. Tempo's source verifier downloads only the solar releases tempo-apps'
+[`solar-downloads.json`](https://github.com/tempoxyz/tempo-apps/blob/main/apps/contract-verification/container/solar-downloads.json)
+lists, so a new release must be added there and deployed before a hosted deployment built with it.
+The compiler is part of every release's identity: CREATE2 release addresses derive from creation
+code, which embeds the compiler's version, so moving to another solar release moves every release
+address. Move only to a published solar release, and only together with a planned factory release.
+Source verification passes Forge the solar build (`--compiler-version`, from
 `solar-solc --version`, with `--compilation-profile default`); a manual
 `forge verify-contract` needs the same two flags. Deploy a core release with:
 
@@ -621,7 +631,9 @@ holds `DEPLOYER_PRIVATE_KEY` (and optional `TEMPO_RPC_URL`, `TEMPO_RPC_USERNAME`
 deployer key, which is also every committed profile's deployer; releases are ownerless, so for them it
 only pays fees. Rotating it updates both environments. Deploy also passes an optional
 `ZONE_ADMIN_PRIVATE_KEY`: where an environment holds it, a profile on a Zone it administers makes
-the [Zone administrator's grants](#commands) itself instead of stopping at that handoff. The network's `hosted-contracts-<network>`
+the [Zone administrator's grants](#commands) itself instead of stopping at that handoff. Hosted E2E
+also reads an optional `END_USER_PRIVATE_KEY`, the [third-party user](e2e-environments.md) distinct from
+the deployer; without it those cases are blocked. The network's `hosted-contracts-<network>`
 queue orders only CI jobs, so do not broadcast with that key locally while a CI deployment runs. The same command runs locally with `DEPLOYER_PRIVATE_KEY` exported,
 for example from a profile's `.env.<id>`; it does not load dotenv files itself.
 
@@ -644,8 +656,8 @@ network to what `main` describes in one dispatch: every shared factory release (
 <network> all`), the Zone router release's `ZoneRouterFactory`, then `pnpm earn deploy` for every
 committed profile on that network (`pnpm profiles --network <network>`, which lists them without
 checking records, so a record a release outdated is redeployed rather than refused). Choose
-`both` (Moderato, then mainnet only after Moderato succeeds), one network, and whether to broadcast;
-without broadcast it simulates the releases and prints each profile's plan. With broadcast,
+`both` (Moderato, then mainnet only after Moderato succeeds), one network, and whether to broadcast
+(off by default); without broadcast it simulates the releases and prints each profile's plan. With broadcast,
 `resubmit-verification` passes `--resubmit-verification` to every release and profile deploy, for a
 verifier entry that differs from the recorded deployment ([repair limits](#source-verification)).
 
@@ -666,6 +678,15 @@ releases take per-deployment parameters and stay with their own workflows.
 
 A change that bumps a release a committed profile uses leaves that profile's record stale until the
 stack is redeployed: dispatch Deploy after it merges, then merge the record pull request.
+
+### Replaced Zone routers
+
+Deploy replaces a Zone router without revoking the old one: its pool allowlist entries and Portal
+gateway stay until their owners remove them, since a router address can serve more than one
+profile. Once nothing uses the old router, the pool owner calls `setTakerAllowed(old, false)` and
+`setRecipientAllowed(old, false)` on the pool, and the Zone administrator calls
+`setGateway(old, false)` on the Portal. Read all three back, and confirm the replacement keeps
+its own.
 
 ### Zone router releases
 
